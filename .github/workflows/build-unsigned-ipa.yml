@@ -1,0 +1,157 @@
+name: Build Unsigned IPA — MyGodotGame
+
+on:
+  workflow_dispatch:
+    inputs:
+      scheme:
+        description: "Xcode scheme name"
+        required: true
+        default: "MyGodotGame"
+      project_path:
+        description: "Path to .xcodeproj or .xcworkspace inside the repo"
+        required: true
+        default: "ios/MyGodotGame.xcodeproj"
+      output_name:
+        description: "Output IPA file name (without .ipa)"
+        required: true
+        default: "MyGodotGame"
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          for XC_APP in $(ls -d /Applications/Xcode*.app 2>/dev/null | sort -Vr); do
+            if sudo xcode-select -s "$XC_APP/Contents/Developer" 2>/dev/null; then
+              echo "Using Xcode: $XC_APP"
+              break
+            fi
+          done
+          echo "Active developer dir: $(xcode-select -p)"
+          xcodebuild -version
+
+      - name: Generate Xcode project if missing (XcodeGen)
+        run: |
+          if ! find . -maxdepth 4 ( -name '*.xcodeproj' -o -name '*.xcworkspace' ) | grep -q . ; then
+            if [ -f project.yml ]; then
+              echo "No Xcode project found — generating from project.yml"
+              brew install xcodegen
+              xcodegen generate
+            fi
+          fi
+
+      - name: Verify Godot export files
+        run: |
+          echo "--- repo contents ---"
+          ls -la
+          MISSING=""
+          if ! find . -maxdepth 4 -name '*.pck' | grep -q . ; then
+            MISSING="$MISSING\n- ملف البيانات (.pck) غير موجود — لعبتك بدون محتوى."
+          fi
+          if ! find . -maxdepth 6 \( -name '*.a' -o -name '*.dylib' -o -name '*.framework' \) | grep -q . ; then
+            MISSING="$MISSING\n- مكتبة Godot (داخل مجلد .xcframework) غير موجودة."
+          fi
+          if ! find . -maxdepth 4 -name '*.xcodeproj' | grep -q . ; then
+            MISSING="$MISSING\n- مجلد المشروع (.xcodeproj) غير موجود."
+          fi
+          if [ -n "$MISSING" ]; then
+            echo "" >&2
+            echo "ملفات ناقصة في المستودع:" >&2
+            printf "$MISSING\n" >&2
+            echo "" >&2
+            echo "الغالب أن الرفع عبر متصفح GitHub تخطى الملفات الكبيرة. ارفع مجلد التصدير كاملاً عبر Git (git add -A) أو GitHub Desktop." >&2
+            exit 1
+          fi
+
+
+      - name: Resolve project or workspace
+        id: project
+        run: |
+          INPUT_PATH="${{ github.event.inputs.project_path }}"
+          if [ -d "$INPUT_PATH" ] || [ -f "$INPUT_PATH" ]; then
+            echo "path=$INPUT_PATH" >> "$GITHUB_OUTPUT"
+            if [[ "$INPUT_PATH" == *.xcworkspace ]]; then
+              echo "type=-workspace" >> "$GITHUB_OUTPUT"
+            else
+              echo "type=-project" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Input path not found: $INPUT_PATH — searching repo..."
+            FOUND=$(find . -maxdepth 4 ( -name '*.xcodeproj' -o -name '*.xcworkspace' ) | head -1 | sed 's|^\./||')
+            if [ -z "$FOUND" ]; then
+              echo "No .xcodeproj or .xcworkspace found" >&2
+              exit 1
+            fi
+            echo "Found: $FOUND"
+            echo "path=$FOUND" >> "$GITHUB_OUTPUT"
+            if [[ "$FOUND" == *.xcworkspace ]]; then
+              echo "type=-workspace" >> "$GITHUB_OUTPUT"
+            else
+              echo "type=-project" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Resolve scheme
+        id: scheme
+        run: |
+          set -e
+          LIST=$(xcodebuild "${{ steps.project.outputs.type }}" "${{ steps.project.outputs.path }}" -list)
+          echo "$LIST"
+          SCHEMES=$(echo "$LIST" | awk '/Schemes:/{flag=1;next}flag{gsub(/^ +| +$/,"");if($0=="")exit;print}')
+          WANTED="${{ github.event.inputs.scheme }}"
+          if echo "$SCHEMES" | grep -Fxq "$WANTED"; then
+            CHOSEN="$WANTED"
+          else
+            CHOSEN=$(echo "$SCHEMES" | head -1)
+            echo "Scheme '$WANTED' not found — using '$CHOSEN'"
+          fi
+          if [ -z "$CHOSEN" ]; then
+            echo "No scheme found in project" >&2
+            exit 1
+          fi
+          echo "name=$CHOSEN" >> "$GITHUB_OUTPUT"
+
+      - name: Build .app bundle (unsigned)
+        run: |
+          set -e
+          xcodebuild             "${{ steps.project.outputs.type }}" "${{ steps.project.outputs.path }}"             -scheme "${{ steps.scheme.outputs.name }}"             -sdk iphoneos             -configuration Release             -derivedDataPath "${{ github.workspace }}/DerivedData"             clean build             CODE_SIGNING_ALLOWED=NO             CODE_SIGNING_REQUIRED=NO             CODE_SIGN_IDENTITY=""             ENTITLEMENTS_FILE=""             PROVISIONING_PROFILE_SPECIFIER=""             ONLY_ACTIVE_ARCH=NO
+
+      - name: Locate built .app and package IPA
+        run: |
+          set -e
+          APP_PATH=$(find "${{ github.workspace }}/DerivedData" -name '*.app' -type d | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app bundle found in DerivedData" >&2
+            find "${{ github.workspace }}/DerivedData" -type d >&2 || true
+            exit 1
+          fi
+          echo "Found .app: $APP_PATH"
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          APP_IN_PAYLOAD=$(find Payload -maxdepth 1 -name '*.app' -type d | head -1)
+          if ! find "$APP_IN_PAYLOAD" -name '*.pck' | grep -q . ; then
+            REPO_PCK=$(find . -path ./Payload -prune -o -name '*.pck' -print | head -1)
+            if [ -n "$REPO_PCK" ]; then
+              echo "Adding game data: $REPO_PCK"
+              cp "$REPO_PCK" "$APP_IN_PAYLOAD/"
+            fi
+          fi
+          zip -r "${{ github.event.inputs.output_name }}.ipa" Payload
+          ls -lh "${{ github.event.inputs.output_name }}.ipa"
+          SIZE=$(stat -f%z "${{ github.event.inputs.output_name }}.ipa")
+          echo "IPA size: $SIZE bytes"
+          if [ "$SIZE" -lt 1000000 ]; then
+            echo "تحذير: حجم الملف صغير جداً ($SIZE بايت) — غالباً محتوى اللعبة (.pck) أو مكتبة Godot غير موجودة في المستودع." >&2
+            exit 1
+          fi
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.output_name }}-ipa
+          path: "${{ github.event.inputs.output_name }}.ipa"
